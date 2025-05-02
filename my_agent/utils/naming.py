@@ -1,0 +1,5 @@
+PLANNER = "planner"
+AGENT = "agent"
+REPLAN = "replan"
+ROUTING = "routing"
+CLEAN_RESPONSE = "end"
