@@ -1,57 +1,85 @@
-# 🧠 LangChain Agent with Routing and Google Calendar Tools
+#  Agent planner
 
-This project is a LangChain-based AI agent designed to route user questions intelligently between two specialized models: a **General Assistant** and a **Developer Assistant**. The General Assistant is further enhanced with tools to interact with **Google Calendar**, allowing it to **read** and **write events**.
+## Overview
 
-## 🚀 Getting Started
+`My Agent` is an AI-driven application designed to execute tasks based on a structured plan. It leverages various AI models and tools to plan, execute, and manage tasks efficiently. The application is built using a modular architecture, making it easy to extend and customize.
 
-1.  **Set up Google Calendar Credentials:**
-    * Go to the [Google Cloud Console](https://console.cloud.google.com/).
-    * Create a project (or select an existing one).
-    * Enable the **Google Calendar API**.
-    * Configure the **OAuth Consent Screen**:
-        * Choose "External" user type (unless using Google Workspace).
-        * Add the required scopes: `.../auth/calendar.readonly` and `.../auth/calendar.events`.
-        * Add your Google account email as a **Test User** while the app is in "Testing" mode.
-    * Go to "Credentials", click "+ Create Credentials" -> "OAuth client ID".
-    * Select **"Desktop app"** as the application type.
-    * Click "Create" and **Download the JSON** credentials file.
-    * **Rename** the downloaded file to `credentials.json` and place it in the **root directory** of this project.
+## Features
 
-2.  **Launch the Agent:**
-    * Ensure you have any other necessary environment variables or API keys set up.
-    * Run the agent in development mode:
-        ```bash
-        langgraph dev
-        ```
+- **Task Planning**: Generates a step-by-step plan for executing tasks.
+- **Task Execution**: Executes tasks based on the generated plan.
+- **Replanning**: Adjusts the plan if necessary.
+- **Routing**: Determines the next step in the workflow.
+- **Response Cleaning**: Cleans and formats the final response.
 
-3.  **First Run Authentication:**
-    * When you first run the agent and it needs to access the calendar, it will open a browser window asking you to log in to your Google account and grant permission (based on the consent screen you configured).
-    * After you grant access, a `token.json` file will be created in the project root to store your authorization for future runs.
+## Directory Structure
 
-## 🧭 Architecture Overview
+```
+.
+├── .env.example
+├── README.md
+├── langgraph.json
+├── requirements.txt
+├── tuto.ipynb
+└── my_agent/
+    ├── agent.py
+    └── utils/
+        ├── calendar_tools.py
+        ├── naming.py
+        ├── nodes.py
+        ├── prompts.py
+        ├── state.py
+        └── tools.py
+```
 
-The core of this agent is a **Router Chain**, which analyzes each incoming question and decides which of the two expert agents should respond:
+## Setup
 
--   **General Model**
-    * Focused on everyday tasks and productivity-related queries.
-    * Equipped with two tools:
-        * `get_calendar_events`: Fetches upcoming events.
-        * `Calendar`: Adds new events to your calendar.
--   **Developer Model**
-    * Specialized in technical questions, programming help, and dev workflows.
+1. **Clone the Repository**
 
-This modular approach allows the system to deliver more accurate and context-aware responses based on the user’s intent.
+   ```bash
+   git clone <repository-url>
+   cd my-agent
+   ```
 
-## 🛠️ Tools
+2. **Install Dependencies**
 
-### General Model Tools
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-| Tool Name              | Description                             |
-|------------------------|-----------------------------------------|
-| `get_calendar_events`  | Retrieves upcoming events from Calendar |
-| `create_calendar_event`| Creates new events in Calendar          |
+3. **Configure Environment Variables**
 
-These tools require valid OAuth credentials and appropriate permissions to access the user's Google Calendar.
+   Copy the `.env.example` file to `.env` and fill in the required API keys and endpoints.
 
+   ```bash
+   cp .env.example .env
+   ```
 
-These tools require the `credentials.json` setup (as described in Getting Started) and user consent via the one-time browser authentication flow.# planning-agent
+   Edit the `.env` file with your API keys:
+
+   ```plaintext
+   SCW_GENERATIVE_APIs_ENDPOINT=https://your-generative-api-endpoint
+   SCW_SECRET_KEY=your-secret-key
+   ANTHROPIC_API_KEY=your-anthropic-api-key
+   ```
+
+## Running the Application
+
+1. **Start the Agent**
+
+   You can run the agent using the following command:
+
+   ```bash
+   langgraph dev
+   ```
+
+2. **Interact with the Agent**
+
+   The agent will prompt you to input a task. It will then plan, execute, and provide a cleaned response.
+
+## Extending the Application
+
+- **Adding New Tools**: You can add new tools by defining them in `my_agent/utils/tools.py` and importing them into the `tools` list.
+- **Customizing Prompts**: Modify the prompts in `my_agent/utils/prompts.py` to tailor the agent's behavior to your needs.
+- **Modifying Workflow**: Adjust the workflow in `my_agent/agent.py` to change the sequence of operations.
+
