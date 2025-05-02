@@ -1,8 +1,8 @@
-#  Agent planner
+#  planning-agent
 
 ## Overview
 
-`My Agent` is an AI-driven application designed to execute tasks based on a structured plan. It leverages various AI models and tools to plan, execute, and manage tasks efficiently. The application is built using a modular architecture, making it easy to extend and customize.
+`planning-agent` is an AI-driven application designed to execute tasks based on a structured plan. It leverages various AI models and tools to plan, execute, and manage tasks efficiently. The application is built using a modular architecture, making it easy to extend and customize.
 
 ## Features
 
@@ -38,7 +38,7 @@
 
    ```bash
    git clone <repository-url>
-   cd my-agent
+   cd planning-agent
    ```
 
 2. **Install Dependencies**
@@ -61,7 +61,10 @@
    SCW_GENERATIVE_APIs_ENDPOINT=https://your-generative-api-endpoint
    SCW_SECRET_KEY=your-secret-key
    ANTHROPIC_API_KEY=your-anthropic-api-key
+   TAVILY_API_KEY=your-tavily-api-key
    ```
+
+   Get the credentials.json file from your google account. 
 
 ## Running the Application
 
