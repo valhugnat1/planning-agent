@@ -28,10 +28,10 @@ llm = ChatOpenAI(
 #     temperature=0.5
 # )
 
-llm_claude = ChatAnthropic(
-    api_key=os.getenv("ANTHROPIC_API_KEY"),
-    model="claude-3-5-sonnet-20241022"
-)
+# llm = ChatAnthropic(
+#     api_key=os.getenv("ANTHROPIC_API_KEY"),
+#     model="claude-3-5-sonnet-20241022"
+# )
 
 # llm = ChatMistralAI(
 #     api_key=os.getenv("MISTRAL_API_KEY"),
@@ -39,8 +39,22 @@ llm_claude = ChatAnthropic(
 # )
 
 
+# llm = llm = ChatOpenAI(
+#     api_key=os.getenv("FIREWORKS_API_KEY"),
+#     base_url="https://api.fireworks.ai/inference/v1",
+#     model="accounts/fireworks/models/qwen3-30b-a3b",
+# )
 
-agent_executor = create_react_agent(llm, tools, prompt=prompt_executor)
+
+llm_tools = ChatOpenAI(
+    api_key="fake",
+    base_url="http://localhost:8000",
+    model="accounts/fireworks/models/qwen3-30b-a3b",
+    streaming=False
+)
+
+
+agent_executor = create_react_agent(llm_tools, tools, prompt=prompt_executor)
 
 planner = planner_prompt | llm.with_structured_output(Plan)
 replanner = replanner_prompt | llm.with_structured_output(Plan)
