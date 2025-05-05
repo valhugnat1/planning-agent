@@ -46,7 +46,7 @@ llm = ChatOpenAI(
 # )
 
 
-llm_tools = ChatOpenAI(
+llm = ChatOpenAI(
     api_key="fake",
     base_url="http://localhost:8000",
     model="accounts/fireworks/models/qwen3-30b-a3b",
@@ -54,7 +54,7 @@ llm_tools = ChatOpenAI(
 )
 
 
-agent_executor = create_react_agent(llm_tools, tools, prompt=prompt_executor)
+agent_executor = create_react_agent(llm, tools, prompt=prompt_executor)
 
 planner = planner_prompt | llm.with_structured_output(Plan)
 replanner = replanner_prompt | llm.with_structured_output(Plan)
