@@ -15,7 +15,7 @@ from dotenv import load_dotenv # To load environment variables from .env file
 # Load environment variables from .env file (optional, good for development)
 load_dotenv()
 
-app = FastAPI(title="OpenAI Proxy API with Tool & Think Tag Parsing")
+app = FastAPI(title="OpenAI Proxy API with Tool & Think Tag Parsing (Stateful Streaming)")
 
 # --- Configuration ---
 # Fetch configuration from environment variables
@@ -74,7 +74,8 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[List[Dict[str, Any]]] = None
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
 
-# --- Helper Function for Parsing Tool Calls and Thinking Tags ---
+# --- Helper Function for Parsing Tool Calls and Thinking Tags (Non-Streaming) ---
+# This function remains unchanged as it correctly handles the final non-streaming output.
 def parse_and_clean_content(raw_content: Optional[str]) -> Dict[str, Any]:
     """
     Parses <tool_call> and <think> tags from raw content.
@@ -96,70 +97,47 @@ def parse_and_clean_content(raw_content: Optional[str]) -> Dict[str, Any]:
     last_end = 0
 
     # Combined regex to find either tag
-    # Use non-capturing groups (?:...) for the alternatives
     tag_regex = re.compile(r"(?:<tool_call>(.*?)</tool_call>)|(?:<think>(.*?)</think>)", re.DOTALL)
 
     for match in tag_regex.finditer(raw_content):
         start, end = match.span()
-        # Add content before the current tag
-        cleaned_parts.append(raw_content[last_end:start])
+        cleaned_parts.append(raw_content[last_end:start]) # Content before tag
 
         tool_call_content = match.group(1)
         think_content = match.group(2)
 
-        if tool_call_content is not None:
-            # Process <tool_call>
+        if tool_call_content is not None: # Process <tool_call>
             try:
                 tool_call_json_str = tool_call_content.strip()
                 tool_call_data = json.loads(tool_call_json_str)
-
                 if "name" in tool_call_data and "arguments" in tool_call_data:
                     # Ensure arguments are a JSON string
                     if isinstance(tool_call_data["arguments"], str):
-                        try:
-                            arguments_obj = json.loads(tool_call_data["arguments"])
-                            arguments_str = json.dumps(arguments_obj)
-                        except json.JSONDecodeError:
-                            arguments_str = tool_call_data["arguments"] # Keep original if not valid JSON
-                    else:
-                        arguments_str = json.dumps(tool_call_data["arguments"])
-
+                        try: arguments_obj = json.loads(tool_call_data["arguments"]); arguments_str = json.dumps(arguments_obj)
+                        except json.JSONDecodeError: arguments_str = tool_call_data["arguments"] # Keep original if not valid JSON
+                    else: arguments_str = json.dumps(tool_call_data["arguments"])
                     tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
-                    parsed_tool_calls.append({
-                        "id": tool_call_id,
-                        "type": "function",
-                        "function": {
-                            "name": tool_call_data["name"],
-                            "arguments": arguments_str,
-                        }
-                    })
+                    parsed_tool_calls.append({"id": tool_call_id, "type": "function", "function": {"name": tool_call_data["name"], "arguments": arguments_str}})
                 else:
                     print(f"Warning: Skipping invalid tool call structure: {tool_call_json_str}")
-                    # If invalid, treat the raw tag as text content
-                    cleaned_parts.append(raw_content[start:end])
+                    cleaned_parts.append(raw_content[start:end]) # Treat as content if structure invalid
             except json.JSONDecodeError as e:
                 print(f"Warning: Failed to parse JSON from tool call: {tool_call_json_str}. Error: {e}")
-                # Treat the raw tag as text content if JSON parsing fails
-                cleaned_parts.append(raw_content[start:end])
+                cleaned_parts.append(raw_content[start:end]) # Treat as content if JSON invalid
 
-        elif think_content is not None:
-            # Process <think>
+        elif think_content is not None: # Process <think>
             reasoning_parts.append(think_content.strip())
-            # Do not add the <think> tag itself to cleaned_parts
+            # Do not add the <think> tag or its content to cleaned_parts
 
         last_end = end
 
-    # Add any remaining content after the last tag
-    cleaned_parts.append(raw_content[last_end:])
+    cleaned_parts.append(raw_content[last_end:]) # Content after last tag
 
-    # Join cleaned parts and reasoning parts
-    final_cleaned_content = "".join(cleaned_parts) if cleaned_parts else None
-    # Strip leading/trailing whitespace that might result from tag removal
-    final_cleaned_content = final_cleaned_content.strip() if final_cleaned_content else None
+    final_cleaned_content = "".join(cleaned_parts).strip() if cleaned_parts else None
     final_reasoning_content = "\n".join(reasoning_parts) if reasoning_parts else None
 
     return {
-        "cleaned_content": final_cleaned_content if final_cleaned_content else None, # Return None if empty after stripping
+        "cleaned_content": final_cleaned_content if final_cleaned_content else None,
         "parsed_tool_calls": parsed_tool_calls if parsed_tool_calls else None,
         "reasoning_content": final_reasoning_content
     }
@@ -172,33 +150,30 @@ async def chat_completions(request: ChatCompletionRequest):
     if not client:
          raise HTTPException(status_code=500, detail="OpenAI client not initialized. Check configuration.")
 
-    # Convert Pydantic models to dictionaries for OpenAI SDK
     messages = [message.model_dump(exclude_none=True) for message in request.messages]
-
-    # Prepare kwargs for OpenAI API call, excluding None values from the request
     kwargs = request.model_dump(exclude_none=True)
-    kwargs["messages"] = messages # Overwrite messages with the processed list
+    kwargs["messages"] = messages
 
-    print(f"Forwarding request to {client.base_url}: {kwargs}") # Log outgoing request
+    print(f"Forwarding request to {client.base_url}: {kwargs}")
 
     try:
-        # Call the downstream OpenAI-compatible API
         response = client.chat.completions.create(**kwargs)
 
         # --- Handle Streaming Response ---
         if request.stream:
-            # This generator handles parsing tool calls and think tags from content within the stream
             def stream_generator():
-                content_buffer = "" # Buffer for accumulating content across chunks
-                current_tool_call_index = 0 # To assign index to streamed tool calls
-                role_sent = False # Track if role has been sent in the stream
-                streamed_tool_calls_exist = False # Track if we yielded any tool calls
-                # Combined regex for streaming parsing
-                tag_regex_stream = re.compile(r"(<tool_call>.*?</tool_call>)|(<think>.*?</think>)", re.DOTALL)
+                # --- State Variables ---
+                content_buffer = ""             # Holds raw content from current chunk
+                current_tool_call_index = 0     # Index for yielded tool calls
+                role_sent = False               # Track if initial role delta was sent
+                streamed_tool_calls_exist = False # Track if any tool calls yielded
+                in_think_block = False          # STATE: Inside <think>...</think>
+                in_tool_call_block = False      # STATE: Inside <tool_call>...</tool_call>
+                tool_call_buffer = ""           # Buffer for content between tool call tags
 
                 try:
                     for chunk in response:
-                        # print(f"Raw Chunk: {chunk.model_dump_json()}") # Debugging
+                        # --- Process Chunk Metadata ---
                         if not chunk.choices:
                             yield f"data: {chunk.model_dump_json()}\n\n"
                             continue
@@ -212,30 +187,33 @@ async def chat_completions(request: ChatCompletionRequest):
                         current_chunk_content = delta.content if delta else None
                         current_chunk_tool_calls = delta.tool_calls if delta else None # Native tool calls
 
-                        # Determine role for the *first* delta chunk yielded from this raw chunk
-                        role_to_yield = None
+                        # Determine role for the *first* delta chunk yielded
+                        role_to_yield_on_first_delta = None
                         if current_chunk_role and not role_sent:
-                            role_to_yield = current_chunk_role
-                            role_sent = True
+                            role_to_yield_on_first_delta = current_chunk_role
                         elif not role_sent and (current_chunk_content or current_chunk_tool_calls):
-                            role_to_yield = "assistant"
-                            role_sent = True
+                            role_to_yield_on_first_delta = "assistant"
 
-                        # --- Step 1: Handle native structured tool calls ---
+                        # --- Step 1: Handle Native Structured Tool Calls (If provided by downstream) ---
                         if current_chunk_tool_calls:
                             print(f"Forwarding structured tool call delta: {current_chunk_tool_calls}")
+                            # Reset state if interrupted by native tool calls
+                            in_think_block = False
+                            in_tool_call_block = False
+                            tool_call_buffer = ""
+
                             structured_tool_chunk_dict = chunk.model_dump(exclude={'choices'})
                             structured_tool_chunk_dict["choices"] = [{
                                 "index": choice.index,
                                 "delta": {
-                                    "role": role_to_yield,
+                                    "role": role_to_yield_on_first_delta,
                                     "content": None,
                                     "tool_calls": [tc.model_dump(exclude_none=True) for tc in current_chunk_tool_calls]
                                 },
                                 "finish_reason": None, "logprobs": None
                             }]
                             yield f"data: {json.dumps(structured_tool_chunk_dict)}\n\n"
-                            role_to_yield = None # Role sent
+                            if role_to_yield_on_first_delta: role_sent = True
 
                             last_tool_call = current_chunk_tool_calls[-1]
                             if last_tool_call.index is not None:
@@ -245,113 +223,183 @@ async def chat_completions(request: ChatCompletionRequest):
                                 content_buffer += current_chunk_content
                             continue # Process next chunk
 
-                        # --- Step 2: Buffer incoming content ---
+                        # --- Step 2: Buffer Incoming Content ---
                         if current_chunk_content:
                             content_buffer += current_chunk_content
 
-                        # --- Step 3: Process buffer for tags and content ---
-                        processed_upto_index = 0
-                        while True:
-                            # Find the *first* occurrence of either tag in the unprocessed buffer part
-                            match = tag_regex_stream.search(content_buffer, pos=processed_upto_index)
-                            if not match:
-                                # No more tags found in the current buffer
-                                break
+                        # --- Step 3: Process Buffer Segment by Segment ---
+                        processed_upto_buffer_idx = 0
+                        while processed_upto_buffer_idx < len(content_buffer):
+                            # Find the earliest relevant tag in the remaining buffer
+                            first_match_pos = float('inf')
+                            action = "content" # Default action
+                            tag_len = 0        # Length of the tag found
 
-                            match_start, match_end = match.span()
-                            tag_content = match.group(0) # Full tag <tag>content</tag>
-                            tool_call_match = match.group(1) # Content of tool_call or None
-                            think_match = match.group(2) # Content of think or None
+                            # Determine next action based on current state and tags found
+                            if not in_think_block and not in_tool_call_block:
+                                think_open_pos = content_buffer.find("<think>", processed_upto_buffer_idx)
+                                tool_open_pos = content_buffer.find("<tool_call>", processed_upto_buffer_idx)
 
-                            # Yield content *before* the found tag
-                            prefix = content_buffer[processed_upto_index:match_start]
-                            if prefix:
-                                print(f"Yielding prefix content delta: '{prefix}'")
-                                prefix_chunk_dict = chunk.model_dump(exclude={'choices'})
-                                prefix_chunk_dict["choices"] = [{
-                                    "index": choice.index,
-                                    "delta": {"role": role_to_yield, "content": prefix}, # DELTA CONTENT
-                                    "finish_reason": None, "logprobs": None
-                                }]
-                                yield f"data: {json.dumps(prefix_chunk_dict)}\n\n"
-                                role_to_yield = None # Role sent
+                                if think_open_pos != -1 and think_open_pos < first_match_pos:
+                                    first_match_pos = think_open_pos
+                                    action = "think_open"
+                                    tag_len = len("<think>")
+                                if tool_open_pos != -1 and tool_open_pos < first_match_pos:
+                                    first_match_pos = tool_open_pos
+                                    action = "tool_call_open"
+                                    tag_len = len("<tool_call>")
 
-                            # Process the found tag
-                            if tool_call_match:
-                                # Attempt to parse the <tool_call> content
-                                tool_call_inner_content = re.search(r"<tool_call>(.*?)</tool_call>", tag_content, re.DOTALL).group(1)
+                            elif in_think_block:
+                                think_close_pos = content_buffer.find("</think>", processed_upto_buffer_idx)
+                                if think_close_pos != -1:
+                                    first_match_pos = think_close_pos
+                                    action = "think_close"
+                                    tag_len = len("</think>")
+
+                            elif in_tool_call_block:
+                                tool_close_pos = content_buffer.find("</tool_call>", processed_upto_buffer_idx)
+                                if tool_close_pos != -1:
+                                    first_match_pos = tool_close_pos
+                                    action = "tool_call_close"
+                                    tag_len = len("</tool_call>")
+
+                            # --- Process content segment before the tag (or all remaining content) ---
+                            segment_end = first_match_pos if first_match_pos != float('inf') else len(content_buffer)
+                            content_segment = content_buffer[processed_upto_buffer_idx:segment_end]
+
+                            if content_segment:
+                                if in_tool_call_block:
+                                    # Append to tool call buffer, don't yield yet
+                                    tool_call_buffer += content_segment
+                                    print(f"Buffering tool call content: '{content_segment}'")
+                                else:
+                                    delta_payload = {"content": ""}
+                                    # Yield content (potentially also as reasoning)
+                                    if in_think_block:
+                                        delta_payload["reasoning_content"] = content_segment
+                                    else : 
+                                        delta_payload = {"content": content_segment}
+
+
+
+                                    print(f"Yielding delta: {delta_payload}")
+                                    yield_choice = {
+                                        "index": choice.index,
+                                        "delta": delta_payload,
+                                        "finish_reason": None, "logprobs": None
+                                    }
+                                    if role_to_yield_on_first_delta and not role_sent:
+                                        yield_choice["delta"]["role"] = role_to_yield_on_first_delta
+                                        role_sent = True
+
+                                    yield_chunk_dict = chunk.model_dump(exclude={'choices'})
+                                    yield_chunk_dict["choices"] = [yield_choice]
+                                    yield f"data: {json.dumps(yield_chunk_dict)}\n\n"
+
+                            processed_upto_buffer_idx = segment_end # Move buffer index past the processed segment
+
+                            # --- Handle the tag action ---
+                            if action == "think_open":
+                                print("Entering think block")
+                                in_think_block = True
+                                processed_upto_buffer_idx += tag_len # Move past tag
+                            elif action == "think_close":
+                                print("Exiting think block")
+                                in_think_block = False
+                                processed_upto_buffer_idx += tag_len # Move past tag
+                            elif action == "tool_call_open":
+                                print("Entering tool call block")
+                                in_tool_call_block = True
+                                tool_call_buffer = "" # Reset buffer
+                                processed_upto_buffer_idx += tag_len # Move past tag
+                            elif action == "tool_call_close":
+                                print(f"Exiting tool call block. Buffer: '{tool_call_buffer}'")
+                                in_tool_call_block = False
+                                processed_upto_buffer_idx += tag_len # Move past tag
+
+                                # Attempt to parse and yield the tool call
                                 try:
-                                    tool_call_data = json.loads(tool_call_inner_content.strip())
+                                    tool_call_data = json.loads(tool_call_buffer.strip())
                                     if "name" in tool_call_data and "arguments" in tool_call_data:
                                         tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+                                        # Ensure arguments are stringified JSON
                                         if isinstance(tool_call_data["arguments"], str):
                                              try: arguments_obj = json.loads(tool_call_data["arguments"]); arguments_str = json.dumps(arguments_obj)
-                                             except json.JSONDecodeError: arguments_str = tool_call_data["arguments"]
+                                             except json.JSONDecodeError: arguments_str = tool_call_data["arguments"] # Keep original if not valid JSON
                                         else: arguments_str = json.dumps(tool_call_data["arguments"])
 
                                         print(f"Yielding parsed tool call (Index {current_tool_call_index}): ID {tool_call_id}, Name {tool_call_data['name']}")
                                         # Yield Name Chunk
                                         tool_chunk_name = chunk.model_dump(exclude={'choices'})
-                                        tool_chunk_name["choices"] = [{"index": choice.index,"delta": {"role": role_to_yield,"content": None,"tool_calls": [{"index": current_tool_call_index,"id": tool_call_id,"type": "function","function": {"name": tool_call_data["name"], "arguments": ""}}]},"finish_reason": None, "logprobs": None}]
+                                        tool_chunk_name_delta = {"role": role_to_yield_on_first_delta if not role_sent else None, "content": None, "tool_calls": [{"index": current_tool_call_index,"id": tool_call_id,"type": "function","function": {"name": tool_call_data["name"], "arguments": ""}}]}
+                                        # Remove None values from delta
+                                        tool_chunk_name_delta = {k:v for k,v in tool_chunk_name_delta.items() if v is not None}
+                                        tool_chunk_name["choices"] = [{"index": choice.index,"delta": tool_chunk_name_delta,"finish_reason": None, "logprobs": None}]
                                         yield f"data: {json.dumps(tool_chunk_name)}\n\n"
-                                        role_to_yield = None # Role sent
+                                        if role_to_yield_on_first_delta and not role_sent: role_sent = True
+
                                         # Yield Arguments Chunk
-                                        if arguments_str:
+                                        if arguments_str: # Only yield if arguments exist
                                             tool_chunk_args = chunk.model_dump(exclude={'choices'})
                                             tool_chunk_args["choices"] = [{"index": choice.index,"delta": {"tool_calls": [{"index": current_tool_call_index,"function": {"arguments": arguments_str}}]},"finish_reason": None, "logprobs": None}]
                                             yield f"data: {json.dumps(tool_chunk_args)}\n\n"
 
                                         current_tool_call_index += 1
                                         streamed_tool_calls_exist = True
-                                        processed_upto_index = match_end # Advance past processed tag
                                     else: # Invalid structure
-                                        print(f"Warning: Skipping invalid tool call structure in stream: {tool_call_inner_content}")
-                                        # Don't advance processed_upto_index, let it be yielded as content later
-                                        break # Stop tag processing for this chunk cycle
-                                except json.JSONDecodeError as e: # Invalid JSON
-                                    print(f"Warning: Failed to parse JSON from tool call in stream: {tool_call_inner_content}. Error: {e}")
-                                    # Don't advance processed_upto_index, let it be yielded as content later
-                                    break # Stop tag processing for this chunk cycle
-
-                            elif think_match:
-                                # Extract thinking content
-                                think_inner_content = re.search(r"<think>(.*?)</think>", tag_content, re.DOTALL).group(1).strip()
-                                if think_inner_content:
-                                    print(f"Yielding reasoning content delta: '{think_inner_content}'")
-                                    # Yield custom chunk with reasoning_content
-                                    reasoning_chunk_dict = chunk.model_dump(exclude={'choices'})
-                                    reasoning_chunk_dict["choices"] = [{
+                                        raise ValueError("Parsed tool call missing 'name' or 'arguments'")
+                                except (json.JSONDecodeError, ValueError) as e:
+                                    # If parsing fails or structure invalid, yield the raw content
+                                    print(f"Warning: Failed to parse tool call buffer or invalid structure: {e}. Yielding raw content.")
+                                    raw_tool_content = f"<tool_call>{tool_call_buffer}</tool_call>"
+                                    delta_payload = {"content": raw_tool_content}
+                                    yield_choice = {
                                         "index": choice.index,
-                                        "delta": {"role": role_to_yield, "reasoning_content": think_inner_content}, # CUSTOM FIELD
+                                        "delta": delta_payload,
                                         "finish_reason": None, "logprobs": None
-                                    }]
-                                    yield f"data: {json.dumps(reasoning_chunk_dict)}\n\n"
-                                    role_to_yield = None # Role sent
-                                processed_upto_index = match_end # Advance past processed tag
+                                    }
+                                    if role_to_yield_on_first_delta and not role_sent:
+                                        yield_choice["delta"]["role"] = role_to_yield_on_first_delta
+                                        role_sent = True
+                                    yield_chunk_dict = chunk.model_dump(exclude={'choices'})
+                                    yield_chunk_dict["choices"] = [yield_choice]
+                                    yield f"data: {json.dumps(yield_chunk_dict)}\n\n"
 
-                        # --- Step 4: Yield remaining content in the buffer ---
-                        remaining_content = content_buffer[processed_upto_index:]
-                        if remaining_content:
-                            print(f"Yielding remaining content delta: '{remaining_content}'")
-                            remaining_content_chunk_dict = chunk.model_dump(exclude={'choices'})
-                            remaining_content_chunk_dict["choices"] = [{
-                                "index": choice.index,
-                                "delta": {"role": role_to_yield, "content": remaining_content}, # DELTA CONTENT
-                                "finish_reason": None,
-                                "logprobs": None
-                            }]
-                            yield f"data: {json.dumps(remaining_content_chunk_dict)}\n\n"
-                            role_to_yield = None # Role sent
+                                tool_call_buffer = "" # Clear buffer after processing
 
-                        # Update buffer: remove the processed/yielded part
-                        content_buffer = content_buffer[processed_upto_index:]
+                            elif action == "content":
+                                # No more tags found in this buffer iteration, loop will check condition and exit
+                                pass
+
+                        # --- Update main content buffer ---
+                        content_buffer = content_buffer[processed_upto_buffer_idx:]
 
                         # --- Step 5: Handle Finish Reason ---
                         if finish_reason:
                             print(f"Received finish_reason: {finish_reason}")
-                            if content_buffer:
-                                print(f"Warning: Stream finished with unprocessed content in buffer: '{content_buffer}'") # Should ideally be empty
+                            # Check for incomplete states
+                            if in_think_block:
+                                print("Warning: Stream finished while inside a <think> block.")
+                            if in_tool_call_block:
+                                print("Warning: Stream finished while inside a <tool_call> block. Yielding buffered content as raw.")
+                                # Yield remaining tool_call_buffer as raw content
+                                if tool_call_buffer:
+                                     raw_tool_content = f"<tool_call>{tool_call_buffer}" # Indicate incomplete tag
+                                     delta_payload = {"content": raw_tool_content}
+                                     yield_choice = { "index": choice.index, "delta": delta_payload, "finish_reason": None, "logprobs": None }
+                                     if role_to_yield_on_first_delta and not role_sent:
+                                         yield_choice["delta"]["role"] = role_to_yield_on_first_delta
+                                         role_sent = True
+                                     yield_chunk_dict = chunk.model_dump(exclude={'choices'})
+                                     yield_chunk_dict["choices"] = [yield_choice]
+                                     yield f"data: {json.dumps(yield_chunk_dict)}\n\n"
 
+                            if content_buffer: # Should ideally be empty
+                                print(f"Warning: Stream finished with unprocessed content in buffer: '{content_buffer}'")
+                                # Optionally yield remaining buffer as content
+                                # delta_payload = {"content": content_buffer} ... yield ...
+
+                            # Determine final reason and yield final chunk
                             final_chunk_dict = chunk.model_dump(exclude={'choices'})
                             final_reason = finish_reason
                             if streamed_tool_calls_exist and finish_reason == 'stop':
@@ -360,9 +408,14 @@ async def chat_completions(request: ChatCompletionRequest):
                             elif finish_reason == 'tool_calls':
                                 streamed_tool_calls_exist = True
 
+                            final_delta = {}
+                            if role_to_yield_on_first_delta and not role_sent:
+                                final_delta["role"] = role_to_yield_on_first_delta
+                                # role_sent = True # Not strictly needed now
+
                             final_chunk_dict["choices"] = [{
                                 "index": choice.index,
-                                "delta": {},
+                                "delta": final_delta,
                                 "finish_reason": final_reason,
                                 "logprobs": logprobs
                             }]
@@ -386,6 +439,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
         # --- Handle Non-Streaming Response ---
         else:
+            # Non-streaming logic remains the same - uses parse_and_clean_content
             print(f"Received non-streaming response from downstream: {response}")
             response_payload = {
                 "id": response.id,
@@ -403,44 +457,39 @@ async def chat_completions(request: ChatCompletionRequest):
                 original_content = message.content
                 original_finish_reason = choice.finish_reason
 
-                # Parse content for tags and clean it
                 parsed_data = parse_and_clean_content(original_content)
                 cleaned_content = parsed_data["cleaned_content"]
                 parsed_tools = parsed_data["parsed_tool_calls"]
                 reasoning_content = parsed_data["reasoning_content"]
 
-                # Initialize choice message structure
                 choice_message_dict = {
                     "role": message.role or "assistant",
-                    "content": cleaned_content, # Use cleaned content
-                    "tool_calls": None, # Initialize
-                    # Add reasoning_content if it exists
+                    "content": cleaned_content,
+                    "tool_calls": None,
                     **({"reasoning_content": reasoning_content} if reasoning_content else {})
                 }
 
-                # Determine final tool calls and finish reason
                 final_tool_calls = None
                 final_finish_reason = original_finish_reason
 
                 if parsed_tools:
-                    # Use tool calls parsed from content
                     print(f"Using tool calls parsed from content in non-streaming choice {i}: {parsed_tools}")
                     final_tool_calls = parsed_tools
+                    # Content should be None if only tool calls remain after cleaning
+                    if final_tool_calls and not cleaned_content:
+                        choice_message_dict["content"] = None
                     if original_finish_reason != "tool_calls":
                         print(f"Overriding finish_reason from '{original_finish_reason}' to 'tool_calls' due to parsed content.")
                         final_finish_reason = "tool_calls"
                 elif message.tool_calls:
-                    # Use pre-structured tool calls from downstream if no tags were parsed
                     print(f"Using pre-structured tool calls from downstream choice {i}: {message.tool_calls}")
                     final_tool_calls = [tc.model_dump(exclude_none=True) for tc in message.tool_calls]
                     # Ensure content is None if structured tool calls exist and no other content remains after cleaning
                     if final_tool_calls and not cleaned_content:
                          choice_message_dict["content"] = None
 
-
                 choice_message_dict["tool_calls"] = final_tool_calls
 
-                # Append the processed choice
                 final_choices.append({
                     "message": choice_message_dict,
                     "index": i,
@@ -466,7 +515,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
 @app.get("/")
 async def root():
-    return {"message": "OpenAI Proxy API with Tool & Think Tag Parsing is running. Send POST requests to /chat/completions or /v1/chat/completions"}
+    return {"message": "OpenAI Proxy API with Tool & Think Tag Parsing (Stateful Streaming) is running. Send POST requests to /chat/completions or /v1/chat/completions"}
 
 # --- Run the application ---
 if __name__ == "__main__":
